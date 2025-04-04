@@ -1,0 +1,231 @@
+	 IDENTIFICATION DIVISION.
+       PROGRAM-ID. BCOBASLA.
+       AUTHOR. JINS ANTONY.
+
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT TRANSACT-IN      ASSIGN TO 'TRANSIN'
+               ORGANIZATION IS LINE SEQUENTIAL.
+           SELECT GL-SUMMARY-OUT   ASSIGN TO 'GLSUMM'
+               ORGANIZATION IS LINE SEQUENTIAL.
+           SELECT AUDIT-LOG-OUT    ASSIGN TO 'AUDITLOG'
+               ORGANIZATION IS LINE SEQUENTIAL.
+           SELECT ERROR-OUT        ASSIGN TO 'ERRORS'
+               ORGANIZATION IS LINE SEQUENTIAL.
+
+       DATA DIVISION.
+       FILE SECTION.
+       FD  TRANSACT-IN.
+       01  TRANSACT-IN-REC.
+           05  TI-POLICY-NO         PIC X(10).
+           05  TI-TRANS-DATE        PIC X(10).
+           05  TI-SUBLEDGER-TYPE    PIC X(5).
+           05  TI-CURRENCY-CODE     PIC X(3).
+           05  TI-AMOUNT            PIC 9(9)V99.
+           05  TI-DESCRIPTION       PIC X(30).
+
+       FD  GL-SUMMARY-OUT.
+       01  GL-SUMMARY-REC           PIC X(80).
+
+       FD  AUDIT-LOG-OUT.
+       01  AUDIT-REC                PIC X(100).
+
+       FD  ERROR-OUT.
+       01  ERROR-REC                PIC X(120).
+
+       WORKING-STORAGE SECTION.
+       01  WS-END-FILE              PIC X VALUE 'N'.
+           88  EOF                  VALUE 'Y'.
+
+       01  WS-TOTAL-AMOUNT          PIC 9(11)V99 VALUE 0.
+       01  WS-AMOUNT-USD            PIC 9(11)V99 VALUE 0.
+       01  WS-ERROR-MSG             PIC X(50).
+       01  WS-AUDIT-DETAIL          PIC X(100).
+       01  WS-SUMMARY-DETAIL        PIC X(80).
+       01  WS-TXN-ID                PIC 9(9) VALUE ZERO.
+       01  WS-TRANS-TIMESTAMP       PIC X(20).
+       01  WS-PREM-START-DATE       PIC X(10).
+       01  WS-PREM-END-DATE         PIC X(10).
+       01  WS-PREM-DURATION-MONTHS  PIC 9(3).
+
+       EXEC SQL INCLUDE SQLCA END-EXEC.
+
+       EXEC SQL INCLUDE DATE TIME END-EXEC.
+
+       PROCEDURE DIVISION.
+       MAIN-LOGIC SECTION.
+           OPEN INPUT TRANSACT-IN
+           OPEN OUTPUT GL-SUMMARY-OUT AUDIT-LOG-OUT ERROR-OUT
+
+           PERFORM UNTIL EOF
+               READ TRANSACT-IN INTO TRANSACT-IN-REC
+                   AT END
+                       SET EOF TO TRUE
+                   NOT AT END
+                       PERFORM PROCESS-TRANSACTION
+               END-READ
+           END-PERFORM
+
+           CLOSE TRANSACT-IN GL-SUMMARY-OUT AUDIT-LOG-OUT ERROR-OUT
+           STOP RUN.
+
+       PROCESS-TRANSACTION SECTION.
+           PERFORM VALIDATE-POLICY
+           IF WS-ERROR-MSG NOT = SPACES
+               MOVE TRANSACT-IN-REC TO ERROR-REC
+               WRITE ERROR-REC
+               EXIT SECTION
+           END-IF
+
+           ADD 1 TO WS-TXN-ID
+           MOVE FUNCTION CURRENT-DATE TO WS-TRANS-TIMESTAMP
+           MOVE TI-AMOUNT TO WS-AMOUNT-USD
+
+           EVALUATE TI-SUBLEDGER-TYPE
+               WHEN 'PREM'
+                   PERFORM PROCESS-PREMIUM
+               WHEN 'CLM'
+                   PERFORM PROCESS-CLAIM
+               WHEN 'COMM'
+                   PERFORM PROCESS-COMMISSION
+               WHEN 'REINS'
+                   PERFORM PROCESS-REINSURANCE
+               WHEN 'EXP'
+                   PERFORM PROCESS-EXPENSE
+               WHEN OTHER
+                   MOVE 'INVALID SUBLEDGER TYPE' TO WS-ERROR-MSG
+                   MOVE TRANSACT-IN-REC TO ERROR-REC
+                   WRITE ERROR-REC
+                   EXIT SECTION
+           END-EVALUATE
+
+           PERFORM WRITE-AUDIT
+           PERFORM WRITE-GL-SUMMARY
+           EXIT SECTION.
+
+       VALIDATE-POLICY SECTION.
+           MOVE SPACES TO WS-ERROR-MSG
+           EXEC SQL
+               SELECT POLICY_STATUS INTO :WS-ERROR-MSG
+               FROM POLICY_TABLE
+               WHERE POLICY_NO = :TI-POLICY-NO
+           END-EXEC
+           IF SQLCODE NOT = 0
+               MOVE 'POLICY NOT FOUND OR INVALID' TO WS-ERROR-MSG
+           END-IF
+           EXIT SECTION.
+
+       PROCESS-PREMIUM SECTION.
+           IF WS-AMOUNT-USD < 0
+               MOVE 'NEGATIVE PREMIUM NOT ALLOWED' TO WS-ERROR-MSG
+               MOVE TRANSACT-IN-REC TO ERROR-REC
+               WRITE ERROR-REC
+               EXIT SECTION
+           END-IF
+           ADD WS-AMOUNT-USD TO WS-TOTAL-AMOUNT
+           DISPLAY 'PREMIUM PROCESSED: ' TI-AMOUNT
+
+           COMPUTE WS-PREM-DURATION-MONTHS = FUNCTION RANDOM(1, 12)
+           MOVE TI-TRANS-DATE TO WS-PREM-START-DATE
+           EXEC SQL
+               SELECT DATE_ADD(:TI-TRANS-DATE, INTERVAL :WS-PREM-DURATION-MONTHS MONTH)
+               INTO :WS-PREM-END-DATE
+           END-EXEC
+
+           EXEC SQL
+               UPDATE POLICY_COVERAGE
+               SET PREMIUM_PAID = PREMIUM_PAID + :WS-AMOUNT-USD,
+                   COVERAGE_END_DATE = :WS-PREM-END-DATE
+               WHERE POLICY_NO = :TI-POLICY-NO
+           END-EXEC
+
+           EXEC SQL
+               INSERT INTO ASL_PREMIUM_LOG
+                   (TXN_ID, POLICY_NO, AMOUNT, TXN_DATE, DESCRIPTION, START_DATE, END_DATE, DURATION_MONTHS)
+               VALUES
+                   (:WS-TXN-ID, :TI-POLICY-NO, :WS-AMOUNT-USD, :TI-TRANS-DATE, :TI-DESCRIPTION,
+                    :WS-PREM-START-DATE, :WS-PREM-END-DATE, :WS-PREM-DURATION-MONTHS)
+           END-EXEC
+           EXIT SECTION.
+
+       PROCESS-CLAIM SECTION.
+           IF WS-AMOUNT-USD <= 0
+               MOVE 'CLAIM AMOUNT MUST BE POSITIVE' TO WS-ERROR-MSG
+               MOVE TRANSACT-IN-REC TO ERROR-REC
+               WRITE ERROR-REC
+               EXIT SECTION
+           END-IF
+           SUBTRACT WS-AMOUNT-USD FROM WS-TOTAL-AMOUNT
+           DISPLAY 'CLAIM PAID: ' TI-AMOUNT
+           EXEC SQL
+               INSERT INTO ASL_CLAIM_LOG
+                   (TXN_ID, POLICY_NO, AMOUNT, TXN_DATE, DESCRIPTION)
+               VALUES
+                   (:WS-TXN-ID, :TI-POLICY-NO, :WS-AMOUNT-USD, :TI-TRANS-DATE, :TI-DESCRIPTION)
+           END-EXEC
+           EXIT SECTION.
+
+       PROCESS-COMMISSION SECTION.
+           IF WS-AMOUNT-USD <= 0
+               MOVE 'COMMISSION AMOUNT INVALID' TO WS-ERROR-MSG
+               MOVE TRANSACT-IN-REC TO ERROR-REC
+               WRITE ERROR-REC
+               EXIT SECTION
+           END-IF
+           ADD WS-AMOUNT-USD TO WS-TOTAL-AMOUNT
+           DISPLAY 'COMMISSION POSTED: ' TI-AMOUNT
+           EXEC SQL
+               INSERT INTO ASL_COMMISSION_LOG
+                   (TXN_ID, POLICY_NO, AMOUNT, TXN_DATE, DESCRIPTION)
+               VALUES
+                   (:WS-TXN-ID, :TI-POLICY-NO, :WS-AMOUNT-USD, :TI-TRANS-DATE, :TI-DESCRIPTION)
+           END-EXEC
+           EXIT SECTION.
+
+       PROCESS-REINSURANCE SECTION.
+           IF WS-AMOUNT-USD <= 0
+               MOVE 'INVALID REINSURANCE AMOUNT' TO WS-ERROR-MSG
+               MOVE TRANSACT-IN-REC TO ERROR-REC
+               WRITE ERROR-REC
+               EXIT SECTION
+           END-IF
+           ADD WS-AMOUNT-USD TO WS-TOTAL-AMOUNT
+           DISPLAY 'REINSURANCE RECORDED: ' TI-AMOUNT
+           EXEC SQL
+               INSERT INTO ASL_REINSURANCE_LOG
+                   (TXN_ID, POLICY_NO, AMOUNT, TXN_DATE, DESCRIPTION)
+               VALUES
+                   (:WS-TXN-ID, :TI-POLICY-NO, :WS-AMOUNT-USD, :TI-TRANS-DATE, :TI-DESCRIPTION)
+           END-EXEC
+           EXIT SECTION.
+
+       PROCESS-EXPENSE SECTION.
+           IF WS-AMOUNT-USD <= 0
+               MOVE 'EXPENSE MUST BE POSITIVE' TO WS-ERROR-MSG
+               MOVE TRANSACT-IN-REC TO ERROR-REC
+               WRITE ERROR-REC
+               EXIT SECTION
+           END-IF
+           SUBTRACT WS-AMOUNT-USD FROM WS-TOTAL-AMOUNT
+           DISPLAY 'EXPENSE LOGGED: ' TI-AMOUNT
+           EXEC SQL
+               INSERT INTO ASL_EXPENSE_LOG
+                   (TXN_ID, POLICY_NO, AMOUNT, TXN_DATE, DESCRIPTION)
+               VALUES
+                   (:WS-TXN-ID, :TI-POLICY-NO, :WS-AMOUNT-USD, :TI-TRANS-DATE, :TI-DESCRIPTION)
+           END-EXEC
+           EXIT SECTION.
+
+       WRITE-AUDIT SECTION.
+           STRING TI-POLICY-NO DELIMITED BY SPACE ' ' TI-SUBLEDGER-TYPE ' '
+               TI-AMOUNT ' USD:' WS-AMOUNT-USD ' DESC:' TI-DESCRIPTION
+               INTO WS-AUDIT-DETAIL
+           WRITE AUDIT-REC FROM WS-AUDIT-DETAIL
+           EXIT SECTION.
+
+       WRITE-GL-SUMMARY SECTION.
+           STRING 'TXN:' WS-TXN-ID ' ' TI-SUBLEDGER-TYPE ' TOTAL USD:' WS-AMOUNT-USD
+               INTO WS-SUMMARY-DETAIL
+           WRITE GL-SUMMARY-REC FROM WS-SUMMARY-DETAIL
+           EXIT SECTION.
